@@ -72,7 +72,6 @@ def decrypt_bits(bits: list) -> int:
     ctr = Counter.new(64, prefix=AES_PREFIX, initial_value=1)
     cipher = AES.new(AES_KEY, AES.MODE_CTR, counter=ctr)
     dec = cipher.decrypt(bytes(bytes_arr)).decode().strip()
-
     return int(dec)
 
 # ================= PSYCHOACOUSTIC =================
@@ -84,10 +83,7 @@ def adaptive_gain(block):
 def embed_watermark(in_wav, out_wav, uid):
     with wave.open(in_wav, 'rb') as w:
         params = w.getparams()
-        audio = np.frombuffer(
-            w.readframes(w.getnframes()),
-            dtype=np.int16
-        ).astype(np.float64)
+        audio = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float64)
 
     bits = encrypt_uid(uid)
     bit_idx = 0
@@ -125,29 +121,18 @@ def embed_watermark(in_wav, out_wav, uid):
 # ================= DETECT =================
 def detect_watermark(wav_path):
     with wave.open(wav_path, 'rb') as w:
-        audio = np.frombuffer(
-            w.readframes(w.getnframes()),
-            dtype=np.int16
-        ).astype(np.float64)
+        audio = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float64)
 
     block_size = int(SAMPLE_RATE * BLOCK_SEC)
     pn_data = generate_pn(len(audio), 42)
 
-    bits = []
     correlations = []
-
     for i in range(0, len(audio) - block_size, block_size):
         block = audio[i:i+block_size]
         pn_block = pn_data[i:i+block_size]
+        correlations.append(np.sum(block * pn_block))
 
-        corr = np.sum(block * pn_block)
-        correlations.append(corr)
-
-    # Majority voting
-    for c in correlations:
-        bits.append(1 if c > 0 else 0)
-
-    bits = bits[:128]
+    bits = [1 if c > 0 else 0 for c in correlations][:128]
 
     try:
         return decrypt_bits(bits)
@@ -156,12 +141,7 @@ def detect_watermark(wav_path):
 
 # ================= FFMPEG =================
 def run_ffmpeg(cmd):
-    subprocess.run(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=True
-    )
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
 # ================= APP =================
 def main():
@@ -177,9 +157,9 @@ def main():
 
         with c1:
             st.subheader("Login")
-            u = st.text_input("Username")
-            p = st.text_input("Password", type="password")
-            if st.button("Login"):
+            u = st.text_input("Username", key="login_user")
+            p = st.text_input("Password", type="password", key="login_pass")
+            if st.button("Login", key="login_btn"):
                 conn = sqlite3.connect(DB_NAME)
                 row = conn.execute(
                     "SELECT id,password FROM users WHERE username=?",
@@ -190,15 +170,16 @@ def main():
                 if row and bcrypt.checkpw(p.encode(), row[1]):
                     st.session_state.uid = row[0]
                     st.rerun()
-                st.error("Invalid login")
+                else:
+                    st.error("Invalid login")
 
         with c2:
             st.subheader("Register")
-            ru = st.text_input("Username", key="ru")
-            re = st.text_input("Email")
-            rp = st.text_input("Phone")
-            rpw = st.text_input("Password", type="password")
-            if st.button("Register"):
+            ru = st.text_input("Username", key="reg_user")
+            re = st.text_input("Email", key="reg_email")
+            rp = st.text_input("Phone", key="reg_phone")
+            rpw = st.text_input("Password", type="password", key="reg_pass")
+            if st.button("Register", key="reg_btn"):
                 h = bcrypt.hashpw(rpw.encode(), bcrypt.gensalt())
                 try:
                     conn = sqlite3.connect(DB_NAME)
@@ -215,7 +196,7 @@ def main():
 
     # ---------- DASHBOARD ----------
     st.sidebar.success(f"UID {st.session_state.uid}")
-    if st.sidebar.button("Logout"):
+    if st.sidebar.button("Logout", key="logout_btn"):
         st.session_state.uid = None
         st.rerun()
 
@@ -229,8 +210,8 @@ def main():
         vids = conn.execute("SELECT filename FROM videos").fetchall()
         conn.close()
 
-        for (fname,) in vids:
-            if st.button(f"Download – {fname}"):
+        for idx, (fname,) in enumerate(vids):
+            if st.button(f"Download – {fname}", key=f"dl_{idx}"):
                 with tempfile.TemporaryDirectory() as tmp:
                     in_v = os.path.join(UPLOAD_DIR, fname)
                     wav1 = os.path.join(tmp, "a.wav")
@@ -246,17 +227,25 @@ def main():
                     ])
 
                     with open(out_v,"rb") as f:
-                        st.download_button("Download", f.read(), file_name=f"protected_{fname}")
+                        st.download_button(
+                            "Download protected video",
+                            f.read(),
+                            file_name=f"protected_{fname}",
+                            key=f"down_btn_{idx}"
+                        )
 
     # ---------- UPLOAD ----------
     with tab2:
-        f = st.file_uploader("Upload video", type=["mp4","mkv","mov"])
-        if f and st.button("Upload"):
+        f = st.file_uploader("Upload video", type=["mp4","mkv","mov"], key="upload_video")
+        if f and st.button("Upload", key="upload_btn"):
             path = os.path.join(UPLOAD_DIR, f.name)
             with open(path,"wb") as out:
                 out.write(f.read())
             conn = sqlite3.connect(DB_NAME)
-            conn.execute("INSERT INTO videos(filename,uploader_id) VALUES(?,?)", (f.name, st.session_state.uid))
+            conn.execute(
+                "INSERT INTO videos(filename,uploader_id) VALUES(?,?)",
+                (f.name, st.session_state.uid)
+            )
             conn.commit()
             conn.close()
             st.success("Uploaded")
@@ -264,7 +253,11 @@ def main():
     # ---------- DETECTOR ----------
     with tab3:
         st.subheader("Watermark Detector")
-        leak = st.file_uploader("Upload leaked video", type=["mp4","mkv","mov"])
+        leak = st.file_uploader(
+            "Upload leaked video",
+            type=["mp4","mkv","mov"],
+            key="detect_video"
+        )
         if leak:
             with tempfile.TemporaryDirectory() as tmp:
                 vid = os.path.join(tmp, "x.mp4")
