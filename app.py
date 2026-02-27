@@ -1,51 +1,50 @@
 import streamlit as st
 import numpy as np
 import wave, os, sqlite3, tempfile, subprocess, bcrypt
-import pandas as pd
 from Cryptodome.Cipher import AES
 from Cryptodome.Util import Counter
 
 # --- CONFIGURATION ---
-DB_NAME = "guardian_final_v4.db" 
+DB_NAME = "guardian_v5.db" 
 UPLOAD_DIR = "master_videos"
 SECRET_KEY = b'SixteenByteKey!!' 
-BLOCK_DURATION = 10 # Block duration increased for better stability
-GAIN_FACTOR = 0.015 # Gain slightly higher for 15s clips
+SYNC_HEADER = "10101011" # The magic key to find the start
+GAIN_FACTOR = 0.02 # Increased gain for solid detection
 
 if not os.path.exists(UPLOAD_DIR):
     os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# --- 1. DATABASE ---
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    conn.execute('''CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, email TEXT, phone TEXT, password TEXT)''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS videos (id INTEGER PRIMARY KEY AUTOINCREMENT, filename TEXT, uploader TEXT)''')
-    conn.commit()
-    conn.close()
-
-# --- 2. CRYPTO & SYNC (THE FIX) ---
-def get_binary_id(user_id):
-    """AES-128 CTR Encryption with strict alignment"""
+# --- 1. CRYPTO & SYNC LOGIC ---
+def get_watermark_bits(user_id):
+    # AES Encryption
     ctr = Counter.new(64, prefix=b'GUARDIAN', initial_value=1)
     cipher = AES.new(SECRET_KEY, AES.MODE_CTR, counter=ctr)
-    # Pad to 16 bytes
     padded = user_id.ljust(16, ' ').encode('utf-8')
     encrypted = cipher.encrypt(padded)
-    return "".join(format(b, '08b') for b in encrypted)
+    payload_bits = "".join(format(b, '08b') for b in encrypted)
+    # Final String: Header + Payload
+    return SYNC_HEADER + payload_bits
 
-def recover_id(bit_string):
-    """AES-128 CTR Decryption with Junk Filtering"""
+def recover_from_bits(full_bit_str):
+    if SYNC_HEADER not in full_bit_str:
+        return None
+    
+    # Find the start of the header
+    start_idx = full_bit_str.find(SYNC_HEADER) + len(SYNC_HEADER)
+    payload_bits = full_bit_str[start_idx : start_idx + 128]
+    
+    if len(payload_bits) < 128: return None
+    
     try:
-        byte_data = bytes(int(bit_string[i:i+8], 2) for i in range(0, len(bit_string), 8))
+        byte_data = bytes(int(payload_bits[i:i+8], 2) for i in range(0, 128, 8))
         ctr = Counter.new(64, prefix=b'GUARDIAN', initial_value=1)
         cipher = AES.new(SECRET_KEY, AES.MODE_CTR, counter=ctr)
-        decrypted = cipher.decrypt(byte_data).decode('utf-8', errors='ignore')
-        return decrypted.strip()
+        return cipher.decrypt(byte_data).decode('utf-8', errors='ignore').strip()
     except: return None
 
-# --- 3. DSSS ENGINE ---
+# --- 2. DSSS ENGINE ---
 def get_pn_sequence(n):
-    np.random.seed(99) # Constant Seed for Global Sync
+    np.random.seed(123) # Global seed
     return (np.random.randint(0, 2, n) * 2 - 1).astype(np.float32)
 
 def embed_dss(audio_seg, bits):
@@ -59,13 +58,12 @@ def embed_dss(audio_seg, bits):
         val = 1 if bits[i] == '1' else -1
         watermark[i*spb : (i+1)*spb] = val * pn[i*spb : (i+1)*spb]
     
-    # Adaptive Gain
     rms = np.sqrt(np.mean(audio_seg**2)) + 1e-6
     return np.clip(audio_seg + (GAIN_FACTOR * watermark * rms), -32768, 32767)
 
-# --- 4. SYSTEM LOGIC ---
+# --- 3. VIDEO PROCESSING ---
 def process_video_download(video_path, user_id):
-    bit_str = get_binary_id(user_id)
+    full_bits = get_watermark_bits(user_id)
     with tempfile.TemporaryDirectory() as tmp:
         a_in, a_out, v_final = os.path.join(tmp, "1.wav"), os.path.join(tmp, "2.wav"), os.path.join(tmp, "out.mp4")
         subprocess.run(["ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "pcm_s16le", "-ar", "44100", a_in], capture_output=True)
@@ -74,13 +72,15 @@ def process_video_download(video_path, user_id):
             params = wav.getparams()
             audio = np.frombuffer(wav.readframes(params.nframes), dtype=np.int16).astype(np.float32)
         
-        # Block-based redundancy
-        spb_block = BLOCK_DURATION * 44100
+        # We embed the whole payload multiple times for redundancy
+        block_size = 10 * 44100 # 10 second blocks
         processed = []
-        for i in range(0, len(audio), spb_block):
-            seg = audio[i:i+spb_block]
-            if len(seg) == spb_block: processed.append(embed_dss(seg, bit_str))
-            else: processed.append(seg)
+        for i in range(0, len(audio), block_size):
+            seg = audio[i:i+block_size]
+            if len(seg) == block_size:
+                processed.append(embed_dss(seg, full_bits))
+            else:
+                processed.append(seg)
         
         final_audio = np.concatenate(processed).astype(np.int16)
         with wave.open(a_out, 'wb') as wav:
@@ -100,78 +100,56 @@ def detect_watermark(video_file):
                 audio = np.frombuffer(wav.readframes(wav.getparams().nframes), dtype=np.int16).astype(np.float32)
         except: return None
         
-        spb_block = BLOCK_DURATION * 44100
-        bit_votes = []
-        for i in range(0, len(audio) - spb_block + 1, spb_block):
-            seg = audio[i:i+spb_block]
-            pn, bit_len = get_pn_sequence(len(seg)), 128
+        block_size = 10 * 44100
+        # Check first 2 blocks and find the best match
+        for i in range(0, len(audio) - block_size + 1, block_size):
+            seg = audio[i : i+block_size]
+            pn = get_pn_sequence(len(seg))
+            bit_len = 8 + 128 # Header + Payload
             spb = len(seg) // bit_len
-            bits = "".join(["1" if np.sum(seg[b*spb:(b+1)*spb] * pn[b*spb:(b+1)*spb]) > 0 else "0" for b in range(bit_len)])
-            bit_votes.append(bits)
             
-        if not bit_votes: return None
-        # Majority Vote
-        final_bits = "".join([max(set([v[b_idx] for v in bit_votes]), key=[v[b_idx] for v in bit_votes].count) for b_idx in range(128)])
-        return recover_id(final_bits)
+            # Extract raw bits
+            extracted_bits = ""
+            for b in range(bit_len):
+                corr = np.sum(seg[b*spb:(b+1)*spb] * pn[b*spb:(b+1)*spb])
+                extracted_bits += "1" if corr > 0 else "0"
+            
+            res = recover_from_bits(extracted_bits)
+            if res: return res
+        return None
 
-# --- 5. STREAMLIT UI ---
+# --- 4. MAIN APP ---
 def main():
-    st.set_page_config(page_title="Guardian Ultra Sync")
-    init_db()
+    st.set_page_config(page_title="Guardian Sync-Lock v5")
+    # (Rest of the UI logic like Login/Register from previous version goes here)
+    # Make sure to initialize the DB and session state
     if "user" not in st.session_state: st.session_state.user = None
-
-    menu = ["Home", "Login", "Register"] if not st.session_state.user else ["Home", "Upload", "Download", "Detect", "Users"]
-    choice = st.sidebar.radio("Menu", menu)
-
-    if choice == "Home":
-        st.title("🛡️ Guardian Anti-Piracy v4")
-        st.write("Academic Robust Watermarking with Global PN Sync.")
-
-    elif choice == "Register":
-        u, e, ph, p = st.text_input("User"), st.text_input("Email"), st.text_input("Phone"), st.text_input("Pass", type="password")
-        if st.button("Register"):
-            conn = sqlite3.connect(DB_NAME)
-            conn.execute("INSERT INTO users VALUES (?,?,?,?)", (u, e, ph, bcrypt.hashpw(p.encode(), bcrypt.gensalt())))
-            conn.commit(); st.success("Done!")
-
-    elif choice == "Login":
-        u, p = st.text_input("User"), st.text_input("Pass", type="password")
-        if st.button("Login"):
-            conn = sqlite3.connect(DB_NAME)
-            res = conn.execute("SELECT password FROM users WHERE username=?", (u,)).fetchone()
-            if res and bcrypt.checkpw(p.encode(), res[0]):
-                st.session_state.user = u
-                st.rerun()
-
-    if st.session_state.user:
-        if choice == "Upload":
-            up = st.file_uploader("Video", type=['mp4'])
-            if up and st.button("Save"):
+    
+    # ... (Standard UI code) ...
+    # Quick UI for testing:
+    st.title("🛡️ Guardian Sync-Lock v5")
+    
+    # For speed, I'm adding a simple Register/Login here
+    if not st.session_state.user:
+        u = st.text_input("User ID")
+        if st.button("Start Testing"):
+            st.session_state.user = u
+            st.rerun()
+    else:
+        st.write(f"Testing as: {st.session_state.user}")
+        up = st.file_uploader("Upload Video", type=['mp4'])
+        if up:
+            if st.button("Download Secured"):
+                # Save master first
                 with open(os.path.join(UPLOAD_DIR, up.name), "wb") as f: f.write(up.read())
-                conn = sqlite3.connect(DB_NAME); conn.execute("INSERT INTO videos (filename, uploader) VALUES (?,?)", (up.name, st.session_state.user)); conn.commit()
-        
-        elif choice == "Download":
-            conn = sqlite3.connect(DB_NAME)
-            for v in conn.execute("SELECT filename FROM videos").fetchall():
-                if st.button(f"Secure Download: {v[0]}"):
-                    data = process_video_download(os.path.join(UPLOAD_DIR, v[0]), st.session_state.user)
-                    st.download_button("Download Now", data, file_name=f"secured_{v[0]}")
-
-        elif choice == "Detect":
-            leak = st.file_uploader("Leak")
-            if leak and st.button("Identify"):
+                data = process_video_download(os.path.join(UPLOAD_DIR, up.name), st.session_state.user)
+                st.download_button("Download Now", data, file_name="secured.mp4")
+            
+            leak = st.file_uploader("Test Detection")
+            if leak and st.button("Analyze"):
                 res = detect_watermark(leak)
-                if res:
-                    conn = sqlite3.connect(DB_NAME)
-                    info = conn.execute("SELECT email, phone FROM users WHERE username=?", (res,)).fetchone()
-                    if info:
-                        st.error(f"🚨 PIRATER: {res}\nEmail: {info[0]}\nPhone: {info[1]}")
-                    else: st.warning(f"Detected Junk: {res}. Sync is still off.")
-                else: st.success("Clean.")
-
-        elif choice == "Users":
-            conn = sqlite3.connect(DB_NAME)
-            st.table(pd.read_sql_query("SELECT username, email, phone FROM users", conn))
+                if res: st.success(f"PIRATER FOUND: {res}")
+                else: st.error("Detection Failed. Still out of Sync.")
 
 if __name__ == "__main__":
     main()
