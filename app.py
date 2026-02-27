@@ -6,17 +6,15 @@ import sqlite3
 import tempfile
 import subprocess
 import bcrypt
-import json
 from Cryptodome.Cipher import AES
 from Cryptodome.Util import Counter
-from Cryptodome.Util.Padding import pad, unpad
 
 # --- CONFIGURATION & CONSTANTS ---
 DB_NAME = "guardian_vault.db"
 UPLOAD_DIR = "master_videos"
-SECRET_KEY = b'SixteenByteKey!!' # Must be 16 bytes for AES-128
-BLOCK_DURATION = 5  # Seconds per redundancy block
-GAIN_FACTOR = 0.005 # Embedding strength (0.005 to 0.01 is ideal)
+SECRET_KEY = b'SixteenByteKey!!' # 16 bytes exactly
+BLOCK_DURATION = 5  # Seconds per redundant block
+GAIN_FACTOR = 0.006 # Adjustable strength
 
 if not os.path.exists(UPLOAD_DIR):
     os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -41,25 +39,27 @@ def check_pass(password, hashed):
 # --- 2. CRYPTOGRAPHY (AES-128 CTR) ---
 def encrypt_id(user_id):
     """Encrypts UserID to binary string using AES-CTR"""
-    # CTR mode doesn't need padding, very robust for stream data
-    cipher = AES.new(SECRET_KEY, AES.MODE_CTR, counter=Counter.new(64))
-    encrypted_bytes = cipher.encrypt(user_id.encode())
-    # Convert to 128-bit fixed binary (Academic constraint)
-    return "".join(format(b, '08b') for b in encrypted_bytes).zfill(128)
+    # Fixed counter for synchronization across embedder/extractor
+    ctr = Counter.new(64, prefix=b'\x00'*8, initial_value=1)
+    cipher = AES.new(SECRET_KEY, AES.MODE_CTR, counter=ctr)
+    encrypted_bytes = cipher.encrypt(user_id.encode().ljust(16, b'\0'))
+    return "".join(format(b, '08b') for b in encrypted_bytes)
 
 def decrypt_bits(bit_string):
     """Converts bits back to UserID"""
     try:
-        byte_data = int(bit_string, 2).to_bytes((len(bit_string) + 7) // 8, 'big')
-        cipher = AES.new(SECRET_KEY, AES.MODE_CTR, counter=Counter.new(64))
-        return cipher.decrypt(byte_data).decode().strip('\x00')
-    except:
+        byte_data = int(bit_string, 2).to_bytes(len(bit_string) // 8, 'big')
+        ctr = Counter.new(64, prefix=b'\x00'*8, initial_value=1)
+        cipher = AES.new(SECRET_KEY, AES.MODE_CTR, counter=ctr)
+        decrypted = cipher.decrypt(byte_data).decode('utf-8', errors='ignore')
+        return decrypted.strip('\x00')
+    except Exception as e:
         return None
 
 # --- 3. SIGNAL PROCESSING (DSSS) ---
 def get_pn_sequence(n):
     """Generates a stable Pseudo-Noise sequence"""
-    np.random.seed(42) # Key for recovery
+    np.random.seed(42) 
     return (np.random.randint(0, 2, n) * 2 - 1).astype(np.float32)
 
 def embed_dss_block(audio_seg, bits):
@@ -73,13 +73,16 @@ def embed_dss_block(audio_seg, bits):
     for i in range(bit_len):
         val = 1 if bits[i] == '1' else -1
         start, end = i * samples_per_bit, (i + 1) * samples_per_bit
-        watermark[start:end] = val * pn[start:end]
+        if end <= n:
+            watermark[start:end] = val * pn[start:end]
         
-    # Adaptive Scaling: Don't embed in silence
+    # Adaptive Scaling: Psychoacoustic Masking
     local_rms = np.sqrt(np.mean(audio_seg**2))
-    strength = GAIN_FACTOR * (local_rms if local_rms > 0.001 else 0)
+    strength = GAIN_FACTOR * (local_rms if local_rms > 0.001 else 0.001)
     
-    return audio_samples_clipt := np.clip(audio_seg + (strength * watermark), -32768, 32767)
+    # Updated: Removed Walrus Operator for compatibility
+    clipt_audio = np.clip(audio_seg + (strength * watermark), -32768, 32767)
+    return clipt_audio
 
 # --- 4. CORE LOGIC: WATERMARKING ---
 def process_video_download(video_path, user_id):
@@ -90,31 +93,34 @@ def process_video_download(video_path, user_id):
         audio_out = os.path.join(tmp, "out.wav")
         video_final = os.path.join(tmp, "final.mp4")
         
-        # Extract Wav
+        # Extract Audio
         subprocess.run(["ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "pcm_s16le", "-ar", "44100", audio_in], capture_output=True)
         
         with wave.open(audio_in, 'rb') as wav:
             params = wav.getparams()
             audio_samples = np.frombuffer(wav.readframes(params.nframes), dtype=np.int16).astype(np.float32)
             
-        # Block-based Redundant Embedding
+        # Time-Interval Redundant Embedding
         samples_per_block = BLOCK_DURATION * params.framerate
-        processed_audio = np.array([], dtype=np.float32)
+        processed_audio_list = []
         
         for i in range(0, len(audio_samples), samples_per_block):
             block = audio_samples[i : i + samples_per_block]
-            if len(block) < samples_per_block: # Pad last block
-                processed_audio = np.append(processed_audio, block)
-                continue
-            wm_block = embed_dss_block(block, bit_str)
-            processed_audio = np.append(processed_audio, wm_block)
+            if len(block) == samples_per_block:
+                wm_block = embed_dss_block(block, bit_str)
+                processed_audio_list.append(wm_block)
+            else:
+                processed_audio_list.append(block)
+        
+        processed_audio = np.concatenate(processed_audio_list)
             
         with wave.open(audio_out, 'wb') as wav:
             wav.setparams(params)
             wav.writeframes(processed_audio.astype(np.int16).tobytes())
             
-        # Merge back
+        # Re-merge Video & Watermarked Audio
         subprocess.run(["ffmpeg", "-y", "-i", video_path, "-i", audio_out, "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", video_final], capture_output=True)
+        
         with open(video_final, 'rb') as f:
             return f.read()
 
@@ -124,30 +130,33 @@ def detect_watermark(video_file):
         a_path = os.path.join(tmp, "leak.wav")
         with open(v_path, "wb") as f: f.write(video_file.read())
         
-        subprocess.run(["ffmpeg", "-i", v_path, "-vn", "-acodec", "pcm_s16le", "-ar", "44100", a_path], capture_output=True)
+        subprocess.run(["ffmpeg", "-y", "-i", v_path, "-vn", "-acodec", "pcm_s16le", "-ar", "44100", a_path], capture_output=True)
         
-        with wave.open(a_path, 'rb') as wav:
-            params = wav.getparams()
-            audio = np.frombuffer(wav.readframes(params.nframes), dtype=np.int16).astype(np.float32)
+        try:
+            with wave.open(a_path, 'rb') as wav:
+                params = wav.getparams()
+                audio = np.frombuffer(wav.readframes(params.nframes), dtype=np.int16).astype(np.float32)
+        except: return None
             
         samples_per_block = BLOCK_DURATION * params.framerate
-        bit_votes = [] # To store bits from all blocks for Majority Voting
+        bit_votes = []
 
+        # Sliding Window / Block-based Extraction
         for i in range(0, len(audio) - samples_per_block + 1, samples_per_block):
             block = audio[i : i + samples_per_block]
             pn = get_pn_sequence(len(block))
-            bit_len = 128
+            bit_len = 128 # 16 bytes * 8 bits
             spb = len(block) // bit_len
             
-            current_block_bits = ""
+            block_bits = ""
             for b in range(bit_len):
                 corr = np.sum(block[b*spb:(b+1)*spb] * pn[b*spb:(b+1)*spb])
-                current_block_bits += "1" if corr > 0 else "0"
-            bit_votes.append(current_block_bits)
+                block_bits += "1" if corr > 0 else "0"
+            bit_votes.append(block_bits)
             
         if not bit_votes: return None
         
-        # Majority Voting across blocks
+        # Majority Voting for Robustness
         final_bits = ""
         for b_idx in range(128):
             votes = [v[b_idx] for v in bit_votes]
@@ -157,34 +166,37 @@ def detect_watermark(video_file):
 
 # --- 5. STREAMLIT UI ---
 def main():
-    st.set_page_config(page_title="Guardian Anti-Piracy", page_icon="🛡️")
+    st.set_page_config(page_title="Guardian Anti-Piracy", layout="wide")
     init_db()
     
     if "user" not in st.session_state: st.session_state.user = None
 
-    menu = ["Home", "Login", "Register", "Upload Video", "Download Video", "Detect Leak"]
-    choice = st.sidebar.selectbox("Navigation", menu)
+    st.sidebar.title("🛡️ Guardian System")
+    menu = ["Home", "Login", "Register"]
+    if st.session_state.user:
+        menu = ["Home", "Upload Video", "Download Video", "Detect Leak"]
+    
+    choice = st.sidebar.radio("Navigation", menu)
 
     if choice == "Home":
-        st.title("🛡️ Guardian: DSSS Video Watermarking")
-        st.markdown("""This academic project demonstrates **Direct Sequence Spread Spectrum (DSSS)** audio watermarking with **AES-128 CTR** encryption.""")
+        st.title("Academic Anti-Piracy Project")
+        st.info("Direct Sequence Spread Spectrum (DSSS) + AES-128 CTR Watermarking")
+        st.write("This system embeds an invisible, encrypted user identity into the audio stream of a video.")
 
     elif choice == "Register":
-        st.subheader("Create Account")
-        u = st.text_input("Username (Unique ID)")
+        u = st.text_input("Username")
         e = st.text_input("Email")
         p = st.text_input("Password", type="password")
-        if st.button("Register"):
+        if st.button("Create Account"):
             conn = sqlite3.connect(DB_NAME)
             try:
                 conn.execute("INSERT INTO users VALUES (?,?,?)", (u, e, hash_pass(p)))
                 conn.commit()
-                st.success("Account Created! Go to Login.")
-            except: st.error("User already exists.")
+                st.success("Success! Please Login.")
+            except: st.error("User exists.")
             conn.close()
 
     elif choice == "Login":
-        st.subheader("Login")
         u = st.text_input("Username")
         p = st.text_input("Password", type="password")
         if st.button("Login"):
@@ -193,47 +205,45 @@ def main():
             if res and check_pass(p, res[0]):
                 st.session_state.user = u
                 st.rerun()
-            else: st.error("Invalid Credentials.")
+            else: st.error("Wrong credentials.")
 
     if st.session_state.user:
-        st.sidebar.write(f"Logged in as: **{st.session_state.user}**")
+        st.sidebar.warning(f"Active User: {st.session_state.user}")
         if st.sidebar.button("Logout"):
             st.session_state.user = None
             st.rerun()
 
         if choice == "Upload Video":
-            st.subheader("Upload Master Content")
-            up = st.file_uploader("Select Video", type=['mp4', 'mkv', 'avi'])
-            if up and st.button("Upload"):
+            up = st.file_uploader("Upload Master Video", type=['mp4', 'mkv'])
+            if up and st.button("Save to Server"):
                 path = os.path.join(UPLOAD_DIR, up.name)
                 with open(path, "wb") as f: f.write(up.read())
                 conn = sqlite3.connect(DB_NAME)
                 conn.execute("INSERT INTO videos (filename, uploader) VALUES (?,?)", (up.name, st.session_state.user))
                 conn.commit()
-                st.success("Video stored safely.")
+                st.success("File uploaded.")
 
         elif choice == "Download Video":
-            st.subheader("Download Secured Content")
             conn = sqlite3.connect(DB_NAME)
             vids = conn.execute("SELECT filename FROM videos").fetchall()
             for v in vids:
-                col1, col2 = st.columns([3, 1])
-                col1.write(v[0])
-                if col2.button("Embed & Download", key=v[0]):
-                    with st.spinner("Embedding User-specific DSSS Watermark..."):
-                        video_bytes = process_video_download(os.path.join(UPLOAD_DIR, v[0]), st.session_state.user)
-                        st.download_button("Click here to Download", video_bytes, file_name=f"secured_{v[0]}")
+                with st.container():
+                    col1, col2 = st.columns([3, 1])
+                    col1.write(v[0])
+                    if col2.button("Embed & Download", key=v[0]):
+                        with st.spinner("Applying DSSS Redundancy..."):
+                            data = process_video_download(os.path.join(UPLOAD_DIR, v[0]), st.session_state.user)
+                            st.download_button("Download Secured File", data, file_name=f"secured_{v[0]}")
 
         elif choice == "Detect Leak":
-            st.subheader("Piracy Detection Center")
-            leak = st.file_uploader("Upload Suspected Video")
-            if leak and st.button("Scan for Watermark"):
-                with st.spinner("Performing Sliding Window Correlation & Majority Voting..."):
+            leak = st.file_uploader("Suspected Video")
+            if leak and st.button("Analyze"):
+                with st.spinner("Extracting Watermark via Majority Voting..."):
                     result = detect_watermark(leak)
                     if result:
-                        st.error(f"🚨 PIRACY DETECTED! Original downloader: **{result}**")
+                        st.error(f"PIRATER FOUND: {result}")
                     else:
-                        st.success("✅ No hidden watermark detected.")
+                        st.success("Clean Video: No Watermark Found.")
 
 if __name__ == "__main__":
     main()
