@@ -15,8 +15,8 @@ from Cryptodome.Util import Counter
 DB_NAME = "guardian.db"
 UPLOAD_DIR = "master_videos"
 
-AES_KEY = b'SixteenByteKey!!'
-AES_PREFIX = b'GUARD'
+AES_KEY = b"SixteenByteKey!!"      # 16 bytes
+AES_PREFIX = b"GUARDIAN"           # ✅ 8 bytes (FIXED)
 
 BASE_GAIN = 0.012
 SYNC_GAIN = 0.02
@@ -24,6 +24,7 @@ SYNC_GAIN = 0.02
 BLOCK_SEC = 0.25
 SYNC_INTERVAL_SEC = 5
 SAMPLE_RATE = 44100
+REDUNDANCY = 3
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -50,7 +51,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-# ================= DSSS =================
+# ================= PN =================
 def generate_pn(n, seed):
     rng = np.random.RandomState(seed)
     return rng.choice([-1, 1], size=n).astype(np.float64)
@@ -63,16 +64,18 @@ def encrypt_uid(uid: int) -> list:
     enc = cipher.encrypt(msg)
     return [int(b) for byte in enc for b in f"{byte:08b}"]
 
-def decrypt_bits(bits: list) -> int:
-    bytes_arr = bytearray()
+def decrypt_bits(bits: list):
+    raw = bytearray()
     for i in range(0, len(bits), 8):
-        byte = int("".join(str(b) for b in bits[i:i+8]), 2)
-        bytes_arr.append(byte)
+        raw.append(int("".join(map(str, bits[i:i+8])), 2))
 
     ctr = Counter.new(64, prefix=AES_PREFIX, initial_value=1)
     cipher = AES.new(AES_KEY, AES.MODE_CTR, counter=ctr)
-    dec = cipher.decrypt(bytes(bytes_arr)).decode().strip()
-    return int(dec)
+    try:
+        dec = cipher.decrypt(bytes(raw)).decode().strip()
+        return int(dec)
+    except:
+        return None
 
 # ================= PSYCHOACOUSTIC =================
 def adaptive_gain(block):
@@ -86,6 +89,7 @@ def embed_watermark(in_wav, out_wav, uid):
         audio = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float64)
 
     bits = encrypt_uid(uid)
+    bits = bits * REDUNDANCY      # ✅ redundancy
     bit_idx = 0
 
     block_size = int(SAMPLE_RATE * BLOCK_SEC)
@@ -97,6 +101,7 @@ def embed_watermark(in_wav, out_wav, uid):
     out = audio.copy()
 
     for i in range(0, len(audio) - block_size, block_size):
+
         block = audio[i:i+block_size]
 
         if i % sync_interval == 0:
@@ -127,17 +132,21 @@ def detect_watermark(wav_path):
     pn_data = generate_pn(len(audio), 42)
 
     correlations = []
+
     for i in range(0, len(audio) - block_size, block_size):
         block = audio[i:i+block_size]
         pn_block = pn_data[i:i+block_size]
         correlations.append(np.sum(block * pn_block))
 
-    bits = [1 if c > 0 else 0 for c in correlations][:128]
+    bits = [1 if c > 0 else 0 for c in correlations]
 
-    try:
-        return decrypt_bits(bits)
-    except:
-        return None
+    # Majority voting
+    final_bits = []
+    for i in range(0, len(bits), REDUNDANCY):
+        chunk = bits[i:i+REDUNDANCY]
+        final_bits.append(1 if sum(chunk) > len(chunk)//2 else 0)
+
+    return decrypt_bits(final_bits[:128])
 
 # ================= FFMPEG =================
 def run_ffmpeg(cmd):
@@ -151,7 +160,7 @@ def main():
     if "uid" not in st.session_state:
         st.session_state.uid = None
 
-    # ---------- LOGIN ----------
+    # -------- LOGIN --------
     if st.session_state.uid is None:
         c1, c2 = st.columns(2)
 
@@ -161,17 +170,12 @@ def main():
             p = st.text_input("Password", type="password", key="login_pass")
             if st.button("Login", key="login_btn"):
                 conn = sqlite3.connect(DB_NAME)
-                row = conn.execute(
-                    "SELECT id,password FROM users WHERE username=?",
-                    (u,)
-                ).fetchone()
+                row = conn.execute("SELECT id,password FROM users WHERE username=?", (u,)).fetchone()
                 conn.close()
-
                 if row and bcrypt.checkpw(p.encode(), row[1]):
                     st.session_state.uid = row[0]
                     st.rerun()
-                else:
-                    st.error("Invalid login")
+                st.error("Invalid login")
 
         with c2:
             st.subheader("Register")
@@ -194,9 +198,9 @@ def main():
                     st.error("Username exists")
         st.stop()
 
-    # ---------- DASHBOARD ----------
+    # -------- DASHBOARD --------
     st.sidebar.success(f"UID {st.session_state.uid}")
-    if st.sidebar.button("Logout", key="logout_btn"):
+    if st.sidebar.button("Logout", key="logout"):
         st.session_state.uid = None
         st.rerun()
 
@@ -204,14 +208,14 @@ def main():
         ["📚 Library", "📤 Upload", "🔍 Detector", "🗄 Database"]
     )
 
-    # ---------- LIBRARY ----------
+    # -------- LIBRARY --------
     with tab1:
         conn = sqlite3.connect(DB_NAME)
         vids = conn.execute("SELECT filename FROM videos").fetchall()
         conn.close()
 
-        for idx, (fname,) in enumerate(vids):
-            if st.button(f"Download – {fname}", key=f"dl_{idx}"):
+        for i, (fname,) in enumerate(vids):
+            if st.button(f"Download {fname}", key=f"dl_{i}"):
                 with tempfile.TemporaryDirectory() as tmp:
                     in_v = os.path.join(UPLOAD_DIR, fname)
                     wav1 = os.path.join(tmp, "a.wav")
@@ -228,36 +232,28 @@ def main():
 
                     with open(out_v,"rb") as f:
                         st.download_button(
-                            "Download protected video",
+                            "Download file",
                             f.read(),
                             file_name=f"protected_{fname}",
-                            key=f"down_btn_{idx}"
+                            key=f"down_{i}"
                         )
 
-    # ---------- UPLOAD ----------
+    # -------- UPLOAD --------
     with tab2:
-        f = st.file_uploader("Upload video", type=["mp4","mkv","mov"], key="upload_video")
+        f = st.file_uploader("Upload video", type=["mp4","mkv","mov"], key="upload_file")
         if f and st.button("Upload", key="upload_btn"):
             path = os.path.join(UPLOAD_DIR, f.name)
             with open(path,"wb") as out:
                 out.write(f.read())
             conn = sqlite3.connect(DB_NAME)
-            conn.execute(
-                "INSERT INTO videos(filename,uploader_id) VALUES(?,?)",
-                (f.name, st.session_state.uid)
-            )
+            conn.execute("INSERT INTO videos(filename,uploader_id) VALUES(?,?)", (f.name, st.session_state.uid))
             conn.commit()
             conn.close()
             st.success("Uploaded")
 
-    # ---------- DETECTOR ----------
+    # -------- DETECTOR --------
     with tab3:
-        st.subheader("Watermark Detector")
-        leak = st.file_uploader(
-            "Upload leaked video",
-            type=["mp4","mkv","mov"],
-            key="detect_video"
-        )
+        leak = st.file_uploader("Upload leaked video", type=["mp4","mkv","mov"], key="detect_file")
         if leak:
             with tempfile.TemporaryDirectory() as tmp:
                 vid = os.path.join(tmp, "x.mp4")
@@ -269,11 +265,11 @@ def main():
                 uid = detect_watermark(wav)
 
                 if uid is not None:
-                    st.success(f"🚨 Piracy detected! User ID: {uid}")
+                    st.success(f"🚨 Piracy detected – User ID: {uid}")
                 else:
                     st.error("No watermark detected")
 
-    # ---------- DATABASE ----------
+    # -------- DATABASE --------
     with tab4:
         conn = sqlite3.connect(DB_NAME)
         st.subheader("Users")
