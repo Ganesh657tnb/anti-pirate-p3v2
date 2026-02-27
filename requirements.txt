@@ -1,0 +1,5 @@
+streamlit
+pycryptodomex
+numpy
+pandas
+bcrypt
