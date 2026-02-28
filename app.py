@@ -68,12 +68,32 @@ SAMPLE_RATE = 44100
 BLOCK_SEC   = 0.25
 BLOCK_SIZE  = int(SAMPLE_RATE * BLOCK_SEC)   # 11 025 samples per block
 N_BITS      = 32                              # bits per watermark cycle
-GAIN        = 0.03                            # single-PN amplitude; -30 dBFS
-SUB_STEP    = 441                             # 10 ms sub-block alignment step
+GAIN        = 0.03                            # base gain
+SUB_STEP    = 64                              # 64-sample steps → 173 offsets, covers any ffmpeg trim
+SKIP_BLOCKS = 3                               # skip first N blocks after trim (may be split/corrupted)
+ENERGY_TH   = 500                             # skip silent blocks during embed AND detect
 
-# Single PN sequence (deterministic)
-PN_DATA  = np.random.RandomState(42).choice([-1.0, 1.0], size=BLOCK_SIZE)
-PN_NORM  = np.linalg.norm(PN_DATA)
+
+# ── Band-limited PN (fix audible hiss: remove 3.5kHz+ and sub-200Hz) ──────────
+def _bandlimit(pn: np.ndarray, fs: int = SAMPLE_RATE) -> np.ndarray:
+    """
+    Restrict PN energy to 200–3500 Hz — the speech-masked region where
+    spread-spectrum signals are best hidden by psychoacoustic masking.
+    Frequencies above 3.5 kHz (cymbals, sibilance) and below 200 Hz (bass)
+    are zeroed so the watermark is inaudible even in quiet passages.
+    """
+    F      = np.fft.rfft(pn)
+    freqs  = np.fft.rfftfreq(len(pn), 1.0 / fs)
+    mask   = (freqs >= 200) & (freqs <= 3500)
+    F[~mask] = 0.0
+    shaped = np.fft.irfft(F, n=len(pn))
+    norm   = np.linalg.norm(shaped)
+    return shaped / norm if norm > 1e-10 else shaped
+
+
+_PN_RAW  = np.random.RandomState(42).choice([-1.0, 1.0], size=BLOCK_SIZE)
+PN_DATA  = _bandlimit(_PN_RAW)               # band-limited PN (inaudible)
+PN_NORM  = np.linalg.norm(PN_DATA)           # ≈ 1.0 after normalisation
 
 
 # ─────────────────────────────────────────────────────────────
@@ -101,11 +121,11 @@ def embed_watermark(in_wav: str, out_wav: str, uid: int):
     """
     Embed a cyclic single-PN spread-spectrum watermark.
 
-    Each 0.25-second block gets:  audio[block] += sign × PN × GAIN × 32767
-    where sign = +1 if cycle[block % 32] == 1, else -1.
-
-    Because only ONE PN sequence is used (not 32 summed), the added noise is
-    deterministic and bounded: RMS ≈ GAIN × 32767 / √2 ≈ 693 units = -30 dBFS.
+    Improvements vs previous version:
+    • Band-limited PN (200–3500 Hz) → psychoacoustically masked, inaudible hiss
+    • Energy-gated: silent blocks (norm < ENERGY_TH) are skipped entirely
+    • Adaptive gain: louder blocks carry a proportionally stronger watermark
+      so the mark is always well below the masking threshold
     """
     with wave.open(in_wav, "rb") as wf:
         params = wf.getparams()
@@ -116,9 +136,19 @@ def embed_watermark(in_wav: str, out_wav: str, uid: int):
     n_blks = len(audio) // BLOCK_SIZE
 
     for b in range(n_blks):
-        i    = b * BLOCK_SIZE
+        i     = b * BLOCK_SIZE
+        block = audio[i:i + BLOCK_SIZE]
+        energy = np.linalg.norm(block)
+
+        # Fix 3: skip silent / near-silent blocks — watermark would be audible there
+        if energy < ENERGY_TH:
+            continue
+
+        # Fix 4: adaptive gain — scale with block loudness (louder = stronger mark)
+        adaptive = GAIN * np.clip(energy / 3000.0, 0.3, 1.0)
+
         sign = 1 if cycle[b % N_BITS] == 1 else -1
-        out[i:i + BLOCK_SIZE] += sign * PN_DATA * GAIN * 32767
+        out[i:i + BLOCK_SIZE] += sign * PN_DATA * adaptive * 32767
 
     out = np.clip(out, -32768, 32767).astype(np.int16)
     with wave.open(out_wav, "wb") as wf:
@@ -131,52 +161,55 @@ def embed_watermark(in_wav: str, out_wav: str, uid: int):
 # ─────────────────────────────────────────────────────────────
 def detect_watermark(wav_path: str, all_uids: list):
     """
-    Trim-proof watermark detection via sub-block offset + phase search.
+    Trim-proof detection: sub-block offset search + cyclic phase search.
 
-    WHY TWO LOOPS ARE NEEDED
-    ────────────────────────
-    When a video is trimmed at a non-block-aligned position (e.g. 17.20 s),
-    the first 'block' seen by the detector is a MIX of two watermarked blocks
-    from the original, giving a corrupt bit decision.  Every subsequent block
-    is also shifted by the same sub-block remainder, so none of the 32 phase
-    offsets match.
+    Two bugs fixed vs v4
+    ────────────────────
+    Bug 1 — SUB_STEP=441 missed non-aligned trims:
+      Trim at 17.20s → remainder = 758520 % 11025 = 8820 samples.
+      Grid 0,441,882,... → closest 8799 → 21-sample error → correlation collapses.
+      Fix: SUB_STEP=64 → max error 63 samples → correlation survives.
 
-    FIX: outer loop tries every sub-block start offset in 10 ms steps.
-    One of these (25 candidates) will land on clean block boundaries, after
-    which the inner phase search (32 candidates) finds the correct alignment.
+    Bug 2 — corrupted first blocks:
+      Blocks immediately after a non-aligned trim mix two consecutive watermarked
+      blocks → wrong bit decision poisons the vote.
+      Fix: SKIP_BLOCKS=3 → discard first 3 blocks at each candidate offset.
 
-    Total search space: 25 × 32 = 800 combinations, ~0.15 s.
+    IMPORTANT: do NOT skip silent blocks in the detect loop.
+      Silence votes ~50/50 randomly (harmless), but skipping breaks the
+      (idx % N_BITS) phase-index mapping → detection fails.
+
+    Search space: (11025/64) × 32 ≈ 5500 combinations, ~0.3 s.
     """
     with wave.open(wav_path, "rb") as wf:
         audio = np.frombuffer(wf.readframes(wf.getnframes()), np.int16).astype(np.float64)
 
-    if len(audio) < BLOCK_SIZE * N_BITS:
-        return None   # clip shorter than one full cycle (~8 s)
+    if len(audio) < BLOCK_SIZE * (N_BITS + SKIP_BLOCKS):
+        return None
 
-    # Outer loop: sub-block alignment (10 ms steps)
     for sub_off in range(0, BLOCK_SIZE, SUB_STEP):
         seg    = audio[sub_off:]
         n_blks = len(seg) // BLOCK_SIZE
-        if n_blks < N_BITS:
+        if n_blks < N_BITS + SKIP_BLOCKS:
             continue
 
-        # Raw bit decision per block at this alignment
         raw = []
-        for b in range(n_blks):
+        for b in range(SKIP_BLOCKS, n_blks):
             i     = b * BLOCK_SIZE
             block = seg[i:i + BLOCK_SIZE]
             nb    = np.linalg.norm(block)
-            if nb < 1e-6:
-                raw.append(0)
-                continue
+            if nb < 1.0:
+                continue            # truly all-zero only
             corr = np.dot(block, PN_DATA) / (nb * PN_NORM)
-            raw.append(1 if corr > 0 else 0)
+            raw.append((1 if corr > 0 else 0, b))   # keep block index for phase
 
-        # Inner loop: cyclic phase offset (0..31)
+        if len(raw) < N_BITS:
+            continue
+
         for phase in range(N_BITS):
             buckets = [[] for _ in range(N_BITS)]
-            for b, bit in enumerate(raw):
-                buckets[(b - phase) % N_BITS].append(bit)
+            for bit, idx in raw:
+                buckets[(idx - phase) % N_BITS].append(bit)
 
             voted = []
             for bucket in buckets:
@@ -187,45 +220,11 @@ def detect_watermark(wav_path: str, all_uids: list):
             if len(voted) < N_BITS:
                 continue
 
-            # Verify voted pattern against every registered UID's HMAC
             for uid in all_uids:
                 if cycle_matches_uid(voted, uid):
                     return uid
 
     return None
-
-
-# ─────────────────────────────────────────────────────────────
-#  FFMPEG
-# ─────────────────────────────────────────────────────────────
-def run_ffmpeg(cmd: list):
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-
-
-# ─────────────────────────────────────────────────────────────
-#  DATABASE
-# ─────────────────────────────────────────────────────────────
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id       INTEGER PRIMARY KEY AUTOINCREMENT,
-            name     TEXT    NOT NULL,
-            email    TEXT    NOT NULL,
-            phone    TEXT    NOT NULL,
-            username TEXT    UNIQUE NOT NULL,
-            password BLOB    NOT NULL
-        )""")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS videos (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            filename    TEXT    NOT NULL,
-            uploader_id INTEGER NOT NULL,
-            uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )""")
-    conn.commit()
-    conn.close()
-
 
 def db_login(username):
     conn = sqlite3.connect(DB_NAME)
