@@ -27,7 +27,7 @@ SKIP_BLOCKS = 3
 ENERGY_TH = 500
 
 # ==========================================================
-# DATABASE INIT  (FIX)
+# DATABASE INIT
 # ==========================================================
 def init_db():
     conn = sqlite3.connect(DB_NAME)
@@ -51,7 +51,7 @@ def init_db():
         filename TEXT NOT NULL,
         uploader_id INTEGER NOT NULL,
         uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (uploader_id) REFERENCES users(id) ON DELETE CASCADE
+        FOREIGN KEY (uploader_id) REFERENCES users(id)
     )
     """)
 
@@ -59,7 +59,7 @@ def init_db():
     conn.close()
 
 # ==========================================================
-# FFMPEG HELPER  (FIX)
+# FFMPEG
 # ==========================================================
 def run_ffmpeg(cmd):
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -67,11 +67,11 @@ def run_ffmpeg(cmd):
         raise RuntimeError(p.stderr)
 
 # ==========================================================
-# PN GENERATION
+# PN
 # ==========================================================
-def _bandlimit(pn, fs=SAMPLE_RATE):
+def _bandlimit(pn):
     F = np.fft.rfft(pn)
-    freqs = np.fft.rfftfreq(len(pn), 1/fs)
+    freqs = np.fft.rfftfreq(len(pn), 1 / SAMPLE_RATE)
     mask = (freqs >= 200) & (freqs <= 3500)
     F[~mask] = 0
     shaped = np.fft.irfft(F, n=len(pn))
@@ -100,9 +100,8 @@ def embed_watermark(in_wav, out_wav, uid):
 
     cycle = uid_to_cycle(uid)
     out = audio.copy()
-    n_blocks = len(audio) // BLOCK_SIZE
 
-    for b in range(n_blocks):
+    for b in range(len(audio) // BLOCK_SIZE):
         i = b * BLOCK_SIZE
         block = audio[i:i+BLOCK_SIZE]
         energy = np.linalg.norm(block)
@@ -120,9 +119,6 @@ def embed_watermark(in_wav, out_wav, uid):
 def detect_watermark(wav, all_uids):
     with wave.open(wav, "rb") as wf:
         audio = np.frombuffer(wf.readframes(wf.getnframes()), np.int16).astype(float)
-
-    if len(audio) < BLOCK_SIZE * (N_BITS + SKIP_BLOCKS):
-        return None
 
     for sub in range(0, BLOCK_SIZE, SUB_STEP):
         seg = audio[sub:]
@@ -159,67 +155,63 @@ def detect_watermark(wav, all_uids):
     return None
 
 # ==========================================================
-# DATABASE HELPERS
+# DB HELPERS
 # ==========================================================
-def db_login(username):
+def db_login(u):
     conn = sqlite3.connect(DB_NAME)
-    row = conn.execute("SELECT id, name, password FROM users WHERE username=?", (username,)).fetchone()
+    row = conn.execute(
+        "SELECT id,name,password FROM users WHERE username=?", (u,)
+    ).fetchone()
     conn.close()
     return row
 
-def db_register(name, email, phone, username, pw):
+def db_register(n,e,p,u,h):
     try:
         conn = sqlite3.connect(DB_NAME)
         conn.execute(
             "INSERT INTO users(name,email,phone,username,password) VALUES(?,?,?,?,?)",
-            (name, email, phone, username, pw)
+            (n,e,p,u,h)
         )
         conn.commit()
         conn.close()
         return True
-    except sqlite3.IntegrityError:
+    except:
         return False
 
 def db_all_uids():
     conn = sqlite3.connect(DB_NAME)
-    rows = conn.execute("SELECT id FROM users").fetchall()
+    r = conn.execute("SELECT id FROM users").fetchall()
     conn.close()
-    return [r[0] for r in rows]
+    return [x[0] for x in r]
 
-def db_add_video(fname, uid):
+def db_add_video(f,uid):
     conn = sqlite3.connect(DB_NAME)
-    conn.execute("INSERT INTO videos(filename,uploader_id) VALUES(?,?)", (fname, uid))
+    conn.execute("INSERT INTO videos(filename,uploader_id) VALUES(?,?)",(f,uid))
     conn.commit()
     conn.close()
 
 def db_videos():
     conn = sqlite3.connect(DB_NAME)
-    rows = conn.execute(
-        "SELECT v.id, v.filename, u.name, v.uploaded_at "
-        "FROM videos v JOIN users u ON v.uploader_id=u.id ORDER BY v.id DESC"
+    r = conn.execute(
+        "SELECT v.id,v.filename,u.name,v.uploaded_at "
+        "FROM videos v JOIN users u ON v.uploader_id=u.id "
+        "ORDER BY v.id DESC"
     ).fetchall()
     conn.close()
-    return rows
+    return r
 
 def db_user_by_id(uid):
     conn = sqlite3.connect(DB_NAME)
-    row = conn.execute(
-        "SELECT id, name, username, email, phone FROM users WHERE id=?", (uid,)
+    r = conn.execute(
+        "SELECT id,name,username,email,phone FROM users WHERE id=?",(uid,)
     ).fetchone()
     conn.close()
-    return row
-
-def db_stats():
-    conn = sqlite3.connect(DB_NAME)
-    nu = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    nv = conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
-    conn.close()
-    return nu, nv
+    return r
 
 # ==========================================================
 # STREAMLIT APP
 # ==========================================================
-st.set_page_config(page_title="Guardian · Anti-Piracy", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Guardian", page_icon="🛡️", layout="wide")
 
 def main():
     init_db()
@@ -228,17 +220,18 @@ def main():
         st.session_state.uid = None
         st.session_state.uname = ""
 
+    # ---------------- LOGIN ----------------
     if st.session_state.uid is None:
-        st.title("🛡️ GUARDIAN – Login")
+        st.title("🛡️ Guardian Login")
 
         u = st.text_input("Username")
         p = st.text_input("Password", type="password")
 
         if st.button("Login"):
-            row = db_login(u)
-            if row and bcrypt.checkpw(p.encode(), row[2]):
-                st.session_state.uid = row[0]
-                st.session_state.uname = row[1]
+            r = db_login(u)
+            if r and bcrypt.checkpw(p.encode(), r[2]):
+                st.session_state.uid = r[0]
+                st.session_state.uname = r[1]
                 st.rerun()
             else:
                 st.error("Invalid credentials")
@@ -247,19 +240,70 @@ def main():
         rn = st.text_input("Name")
         re = st.text_input("Email")
         rp = st.text_input("Phone")
-        ru = st.text_input("New Username")
-        rpw = st.text_input("New Password", type="password")
+        ru = st.text_input("Username (new)")
+        rpw = st.text_input("Password (new)", type="password")
 
         if st.button("Register"):
             h = bcrypt.hashpw(rpw.encode(), bcrypt.gensalt())
-            if db_register(rn, re, rp, ru, h):
+            if db_register(rn,re,rp,ru,h):
                 st.success("Account created")
             else:
                 st.error("Username exists")
         st.stop()
 
+    # ---------------- MAIN UI ----------------
     st.success(f"Logged in as {st.session_state.uname} (UID {st.session_state.uid})")
-    st.write("Upload, download, and detect piracy safely.")
+
+    t1, t2, t3, t4 = st.tabs(["📚 Library","📤 Upload","🔍 Detector","🗄 Database"])
+
+    # Library
+    with t1:
+        for vid, fname, uname, ts in db_videos():
+            st.write(f"🎬 {fname} — {uname}")
+            if st.button("Prepare Download", key=f"d{vid}"):
+                with tempfile.TemporaryDirectory() as tmp:
+                    master = os.path.join(UPLOAD_DIR, fname)
+                    raw = os.path.join(tmp,"a.wav")
+                    wm = os.path.join(tmp,"w.wav")
+                    out = os.path.join(tmp,"o.mp4")
+
+                    run_ffmpeg(["ffmpeg","-y","-i",master,"-vn","-ac","1","-ar","44100","-acodec","pcm_s16le",raw])
+                    embed_watermark(raw, wm, st.session_state.uid)
+                    run_ffmpeg(["ffmpeg","-y","-i",master,"-i",wm,"-map","0:v","-map","1:a","-c:v","copy","-c:a","aac",out])
+
+                    with open(out,"rb") as f:
+                        st.download_button("⬇ Download", f.read(), file_name=f"guardian_{fname}")
+
+    # Upload
+    with t2:
+        f = st.file_uploader("Upload video", type=["mp4","mkv","mov"])
+        if f and st.button("Upload"):
+            p = os.path.join(UPLOAD_DIR, f.name)
+            with open(p,"wb") as o: o.write(f.read())
+            db_add_video(f.name, st.session_state.uid)
+            st.success("Uploaded")
+
+    # Detector
+    with t3:
+        f = st.file_uploader("Upload leaked video", type=["mp4","mkv","mov"], key="leak")
+        if f and st.button("Detect"):
+            with tempfile.TemporaryDirectory() as tmp:
+                v = os.path.join(tmp,"v.mp4")
+                w = os.path.join(tmp,"a.wav")
+                with open(v,"wb") as o: o.write(f.read())
+                run_ffmpeg(["ffmpeg","-y","-i",v,"-vn","-ac","1","-ar","44100","-acodec","pcm_s16le",w])
+                uid = detect_watermark(w, db_all_uids())
+                if uid:
+                    st.error(f"🚨 Piracy detected: UID {uid}")
+                else:
+                    st.success("No watermark found")
+
+    # Database
+    with t4:
+        conn = sqlite3.connect(DB_NAME)
+        st.dataframe(pd.read_sql("SELECT * FROM users", conn))
+        st.dataframe(pd.read_sql("SELECT * FROM videos", conn))
+        conn.close()
 
 if __name__ == "__main__":
     main()
